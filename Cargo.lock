@@ -1248,6 +1248,7 @@ name = "nyx-accounts-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "gio",
  "glib",
  "oauth2",

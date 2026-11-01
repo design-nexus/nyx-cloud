@@ -1140,6 +1140,7 @@ async fn main() -> Result<()> {
             .open(config())?;
     }
     let runtime = runtime()?;
+    let _generation = nyx_accounts_native::service_lifetime_lock(&runtime.join("service.lock"))?;
     let rc_path = runtime.join("rclone.sock");
     let connection = zbus::connection::Builder::session()?
         .name(BUS)?
@@ -1318,7 +1319,7 @@ async fn main() -> Result<()> {
             }
         }
     });
-    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = async { let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler"); sig.recv().await; } => {} }
+    tokio::select! { _ = nyx_accounts_native::wait_for_bus_disconnect(connection.clone()) => {}, _ = tokio::signal::ctrl_c() => {}, _ = async { let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler"); sig.recv().await; } => {} }
     let snapshot = state.remotes.lock().await.clone();
     for r in snapshot {
         let _ = state.stop_mount(&r.id).await;
