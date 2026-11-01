@@ -1246,6 +1246,7 @@ dependencies = [
 [[package]]
 name = "nyx-accounts-service"
 version = "0.1.0"
+source = "git+https://github.com/design-nexus/nyx-accounts.git?rev=ecbe31cbfe6688dd5b3d7803c58e433715427c57#ecbe31cbfe6688dd5b3d7803c58e433715427c57"
 dependencies = [
  "anyhow",
  "futures-util",
