@@ -32,8 +32,57 @@ fn config_dir() -> PathBuf {
 fn config() -> PathBuf {
     config_dir().join("rclone.conf")
 }
-fn mounts() -> PathBuf {
+fn legacy_mounts() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("nyx/cloud/mounts")
+}
+fn mount_folder(name: &str) -> String {
+    let folder: String = name
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c.is_control() { '-' } else { c })
+        .collect();
+    if folder.is_empty() || folder.starts_with('.') {
+        "Cloud".into()
+    } else {
+        folder
+    }
+}
+// Earlier accounts keep their folder; later duplicates get " (2)", " (3)", ...
+fn assign_mount_path(remotes: &mut [Remote], id: &str) {
+    let Some(index) = remotes.iter().position(|r| r.id == id) else {
+        return;
+    };
+    let folder = mount_folder(&remotes[index].name);
+    let taken: HashSet<&str> = remotes
+        .iter()
+        .filter(|r| r.id != id)
+        .map(|r| r.mount_path.as_str())
+        .collect();
+    let path = (1..)
+        .map(|n| match n {
+            1 => folder.clone(),
+            n => format!("{folder} ({n})"),
+        })
+        .map(|f| home().join(f).to_string_lossy().into_owned())
+        .find(|p| !taken.contains(p.as_str()))
+        .expect("unbounded suffixes");
+    remotes[index].mount_path = path;
+}
+fn mount_path_safe(path: &Path) -> bool {
+    path.parent() == Some(home().as_path())
+        && path
+            .file_name()
+            .is_some_and(|n| !n.as_encoded_bytes().starts_with(b"."))
+}
+fn mount_listed(mountinfo: &str, path: &str) -> bool {
+    let escaped = path
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012");
+    mountinfo
+        .lines()
+        .any(|line| line.split_whitespace().nth(4) == Some(escaped.as_str()))
 }
 fn cache(id: &str) -> PathBuf {
     xdg("XDG_CACHE_HOME", ".cache").join("nyx/cloud").join(id)
@@ -106,6 +155,15 @@ impl State {
             .find(|r| r.id == id)
             .cloned()
             .context("Account no longer exists")
+    }
+    // A live mount keeps its folder; a rename takes effect at the next mount.
+    async fn refresh_mount_path(&self, id: &str) -> Result<Remote> {
+        let r = self.get(id).await?;
+        if mounted(&r.mount_path).await {
+            return Ok(r);
+        }
+        assign_mount_path(&mut self.remotes.lock().await, id);
+        self.get(id).await
     }
     async fn status(&self, id: &str, connection: &str, mount: &str, error: &str) {
         if let Some(r) = self.remotes.lock().await.iter_mut().find(|r| r.id == id) {
@@ -184,11 +242,11 @@ impl State {
         if self.children.lock().await.contains_key(id) && mounted(&r.mount_path).await {
             return Ok(());
         }
+        let r = self.refresh_mount_path(id).await?;
         let path = PathBuf::from(&r.mount_path);
-        if path != mounts().join(id) {
+        if !mount_path_safe(&path) {
             bail!("Unsafe mount path");
         }
-        private_dir(&mounts())?;
         if mounted(&r.mount_path).await {
             bail!("Mountpoint already in use");
         }
@@ -197,7 +255,10 @@ impl State {
                 || m.file_type().is_symlink()
                 || std::fs::read_dir(&path)?.next().is_some()
             {
-                bail!("Mountpoint is not an empty directory");
+                bail!(
+                    "~/{} already exists and isn't empty. Rename the account or move that folder.",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
             }
         }
         private_dir(&path)?;
@@ -288,6 +349,7 @@ impl State {
                 let _ = child.kill().await;
             }
         }
+        let _ = std::fs::remove_dir(&r.mount_path);
         self.status(id, "disconnected", "unmounted", "").await;
         Ok(())
     }
@@ -342,11 +404,10 @@ impl State {
     }
 }
 async fn mounted(path: &str) -> bool {
-    tokio::fs::read_to_string("/proc/self/mountinfo")
+    let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
         .await
-        .unwrap_or_default()
-        .lines()
-        .any(|line| line.split_whitespace().nth(4) == Some(path))
+        .unwrap_or_default();
+    mount_listed(&mountinfo, path)
 }
 struct Cloud(Arc<State>);
 fn error(e: impl std::fmt::Display) -> zbus::fdo::Error {
@@ -396,10 +457,11 @@ impl Cloud {
                 .map(ToString::to_string)
                 .unwrap_or_default();
             if result.is_err() && kind == "mount" {
-                let auth = state
-                    .get(&id)
-                    .await
-                    .is_ok_and(|r| r.connection == "authentication_required");
+                let remote = state.get(&id).await;
+                if let Ok(r) = &remote {
+                    let _ = std::fs::remove_dir(&r.mount_path);
+                }
+                let auth = remote.is_ok_and(|r| r.connection == "authentication_required");
                 if !auth {
                     state.status(&id, "error", "unmounted", &message).await;
                 }
@@ -435,10 +497,10 @@ impl Cloud {
             handle.abort();
             self.0.busy.lock().await.remove(&id);
             let is_mounted = self.0.get(&id).await.ok().is_some_and(|r| {
-                std::fs::read_to_string("/proc/self/mountinfo")
-                    .unwrap_or_default()
-                    .lines()
-                    .any(|line| line.split_whitespace().nth(4) == Some(r.mount_path.as_str()))
+                mount_listed(
+                    &std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(),
+                    &r.mount_path,
+                )
             });
             self.0
                 .status(
@@ -485,6 +547,7 @@ impl Cloud {
         }
         let id = uuid::Uuid::new_v4().to_string();
         remotes.push(new_remote(&id, name, name, &d.provider, false));
+        assign_mount_path(&mut remotes, &id);
         drop(remotes);
         self.0.save().await.map_err(error)?;
         self.0.notify().await;
@@ -531,11 +594,11 @@ impl Cloud {
         let id = uuid::Uuid::new_v4().to_string();
         let remote = format!("nyx_{}", uuid::Uuid::new_v4().simple());
         self.0.rc("config/create", json!({"name":remote,"type":provider,"parameters":params,"opt":{"nonInteractive":true,"obscure":false}})).await.map_err(|_|error("Unable to import authorization"))?;
-        self.0
-            .remotes
-            .lock()
-            .await
-            .push(new_remote(&id, name, &remote, &provider, true));
+        {
+            let mut remotes = self.0.remotes.lock().await;
+            remotes.push(new_remote(&id, name, &remote, &provider, true));
+            assign_mount_path(&mut remotes, &id);
+        }
         if let Err(e) = self.0.save().await {
             self.0.remotes.lock().await.retain(|r| r.id != id);
             let _ = self.0.rc("config/delete", json!({"name":remote})).await;
@@ -659,6 +722,7 @@ impl Cloud {
         r.name = name.trim().into();
         r.preferences = prefs;
         drop(remotes);
+        self.0.refresh_mount_path(id).await.map_err(error)?;
         self.0.save().await.map_err(error)?;
         self.0.notify().await;
         Ok(())
@@ -719,7 +783,7 @@ fn new_remote(id: &str, display: &str, remote: &str, provider: &str, managed: bo
         managed,
         connection: "disconnected".into(),
         mount_status: "unmounted".into(),
-        mount_path: mounts().join(id).to_string_lossy().into(),
+        mount_path: String::new(),
         error: String::new(),
         preferences: Preferences::default(),
         account_id: None,
@@ -798,7 +862,7 @@ async fn setup(state: Arc<State>, listener: tokio::net::UnixListener) -> Result<
                         r.account_id=Some(account_id.into());
                     }
                     if r.preferences.cache_mib == 0 { bail!("Invalid cache size"); }
-                    state.remotes.lock().await.push(r);
+                    { let mut remotes = state.remotes.lock().await; remotes.push(r); assign_mount_path(&mut remotes, &id); }
                     let tested = tokio::select! {
                         result = state.test(&id) => result,
                         _ = stream.fill_buf() => Err(anyhow::anyhow!("Setup cancelled")),
@@ -809,6 +873,7 @@ async fn setup(state: Arc<State>, listener: tokio::net::UnixListener) -> Result<
                         remotes.retain(|r| r.id != id);
                         let current = remotes.iter_mut().find(|r| r.id == old.id).context("Account removed during setup")?;
                         current.remote_name = remote.clone(); current.name = name.into(); current.connection = "connected".into(); current.error.clear();
+                        assign_mount_path(&mut remotes, &old.id);
                         old.id.clone()
                     } else { id };
                     if let Err(e) = state.save().await {
@@ -1113,7 +1178,15 @@ async fn notes_session(
 #[tokio::main]
 async fn main() -> Result<()> {
     private_dir(&config_dir())?;
-    private_dir(&mounts())?;
+    if let Ok(entries) = std::fs::read_dir(legacy_mounts()) {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        for entry in entries.flatten() {
+            if !mount_listed(&mountinfo, &entry.path().to_string_lossy()) {
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(legacy_mounts());
+    }
     if !config().exists() {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -1174,10 +1247,14 @@ async fn main() -> Result<()> {
         if !id_valid(&r.id) {
             bail!("Invalid persisted cloud account identifier; metadata preserved");
         }
-        r.mount_path = mounts().join(&r.id).to_string_lossy().into();
+        r.mount_path.clear();
         r.connection = "disconnected".into();
         r.mount_status = "unmounted".into();
         r.error.clear();
+    }
+    let ids: Vec<String> = remotes.iter().map(|r| r.id.clone()).collect();
+    for id in &ids {
+        assign_mount_path(&mut remotes, id);
     }
     let version_output = Command::new("rclone").arg("version").output().await?;
     if !version_output.status.success() {
@@ -1254,6 +1331,7 @@ async fn main() -> Result<()> {
                             .status()
                             .await;
                     }
+                    let _ = std::fs::remove_dir(&r.mount_path);
                 }
                 monitor
                     .status(
