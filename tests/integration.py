@@ -5,7 +5,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUS = 'io.github.design_nexus.nyx.Cloud1'
 def call(method, *args):
     owner=subprocess.check_output(['gdbus','call','--session','--dest','org.freedesktop.DBus','--object-path','/org/freedesktop/DBus','--method','org.freedesktop.DBus.NameHasOwner',BUS],text=True)
-    if not ast.literal_eval(owner)[0]:
+    if owner.strip() != '(true,)':
         raise subprocess.CalledProcessError(1,['Cloud service not ready'])
 
     out = subprocess.check_output(['gdbus', 'call', '--session', '--dest', BUS, '--object-path', '/io/github/design_nexus/nyx/Cloud1', '--method', BUS+'.'+method, *args], stderr=subprocess.PIPE, text=True)
