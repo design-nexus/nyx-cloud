@@ -31,6 +31,8 @@ fn enabled_by_default() -> bool {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Remote {
+    #[serde(default)]
+    pub native_account: bool,
     pub id: String,
     pub name: String,
     pub provider: String,
@@ -62,6 +64,7 @@ pub struct Discovery {
 )]
 pub trait Cloud {
     fn cancel(&self, operation: &str) -> zbus::Result<()>;
+    fn link_native_account(&self, account_id: &str) -> zbus::Result<String>;
     fn list_remotes(&self) -> zbus::Result<String>;
     fn discover(&self) -> zbus::Result<String>;
     fn adopt(&self, name: &str) -> zbus::Result<String>;
@@ -102,6 +105,12 @@ impl Client {
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?,
+        })
+    }
+    pub fn link_native_account(&self, account_id: &str) -> anyhow::Result<String> {
+        self.runtime.block_on(async {
+            let connection=zbus::Connection::session().await?;
+            Ok(CloudProxy::new(&connection).await?.link_native_account(account_id).await?)
         })
     }
     pub fn list(&self) -> anyhow::Result<Vec<Remote>> {

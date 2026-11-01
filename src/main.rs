@@ -1,3 +1,4 @@
+mod native;
 use anyhow::{Context, Result, bail};
 use nyx_cloud::{BUS, Discovery, NotesPreferences, PATH, Preferences, Remote};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,8 @@ struct Saved {
     remotes: Vec<Remote>,
 }
 struct State {
+    broker_port: u16,
+    broker_grants: Mutex<HashMap<String,String>>,
     version: String,
     setup_gate: Mutex<()>,
     remotes: Mutex<Vec<Remote>>,
@@ -115,7 +118,8 @@ impl State {
         }
         self.notify().await;
     }
-    fn command(&self, r: &Remote) -> Result<Command> {
+    async fn command(&self, r: &Remote) -> Result<Command> {
+        if r.native_account { return native::command(self,r).await; }
         let path = if r.managed {
             config()
         } else {
@@ -203,7 +207,7 @@ impl State {
         private_dir(&path)?;
         private_dir(&cache(id))?;
         self.status(id, "connecting", "mounting", "").await;
-        let mut command = self.command(&r)?;
+        let mut command = self.command(&r).await?;
         command
             .args([
                 "mount",
@@ -293,7 +297,7 @@ impl State {
     }
     async fn test(&self, id: &str) -> Result<()> {
         let r = self.get(id).await?;
-        let mut cmd = self.command(&r)?;
+        let mut cmd = self.command(&r).await?;
         cmd.kill_on_drop(true);
         cmd.args([
             "lsjson",
@@ -454,6 +458,17 @@ impl Cloud {
                 .await;
         }
         Ok(())
+    }
+    async fn link_native_account(&self, account_id: &str) -> zbus::fdo::Result<String> {
+        let id=account_id.to_owned();
+        let account=tokio::task::spawn_blocking(move|| {
+            nyx_accounts_native::Client::connect()?.list()?.into_iter().find(|a|a.id==id).context("Native account not found")
+        }).await.map_err(|_|error("Account lookup failed"))?.map_err(|_|error("Native account unavailable"))?;
+        if !account.enabled.contains(&nyx_accounts_native::Service::Files){return Err(error("Enable Files in Online Accounts first"));}
+        if let Some(existing)=self.0.remotes.lock().await.iter().find(|r|r.account_id.as_deref()==Some(account_id)){return Ok(existing.id.clone());}
+        let id=uuid::Uuid::new_v4().to_string();
+        let mut remote=new_remote(&id,account.label(),&format!("nyx_{}",id.replace('-',"")),match account.provider.as_str(){"google"=>"drive","microsoft_personal"=>"onedrive",_=>"webdav"},true);
+        remote.native_account=true;remote.account_id=Some(account.id);self.0.remotes.lock().await.push(remote);self.0.save().await.map_err(|_|error("Could not save native storage account"))?;self.0.notify().await;Ok(id)
     }
     async fn list_remotes(&self) -> zbus::fdo::Result<String> {
         let snapshot = self.0.remotes.lock().await.clone();
@@ -669,7 +684,7 @@ impl Cloud {
             return Err(error("Wait for the current account operation"));
         }
         self.0.stop_mount(id).await.map_err(error)?;
-        if delete_configuration {
+        if delete_configuration && !r.native_account {
             if !r.managed {
                 return Err(error(
                     "External configuration is preserved. Remove it with its original configuration tool.",
@@ -711,6 +726,7 @@ impl Cloud {
 }
 fn new_remote(id: &str, display: &str, remote: &str, provider: &str, managed: bool) -> Remote {
     Remote {
+        native_account: false,
         id: id.into(),
         name: display.into(),
         provider: provider.into(),
@@ -761,6 +777,7 @@ async fn setup(state: Arc<State>, listener: tokio::net::UnixListener) -> Result<
                     let mut parameters = request["parameters"].clone();
                     if !created && let Some(id) = request["replace"].as_str() {
                         let old = state.get(id).await?;
+                        if old.native_account { bail!("Reauthenticate this account in Settings Online Accounts"); }
                         if !old.managed { bail!("External credentials are preserved"); }
                         if mounted(&old.mount_path).await { bail!("Disconnect the account before signing in again"); }
                         if !state.busy.lock().await.insert(id.into()) { bail!("Account is busy"); }
@@ -872,7 +889,7 @@ async fn notes_command(
     limit: usize,
 ) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
-    let mut command = state.command(remote)?;
+    let mut command = state.command(remote).await?;
     command
         .args(args)
         .args([
@@ -926,7 +943,7 @@ async fn notes_command(
 async fn notes_snapshot(state: &State, r: &Remote) -> Result<Vec<NoteRevision>> {
     let root = format!("{}:{}/revisions", r.remote_name, r.notes.folder);
     // A missing folder is a fresh vault. Other failures must remain errors.
-    let mut command = state.command(r)?;
+    let mut command = state.command(r).await?;
     let output = command
         .args([
             "lsjson",
@@ -1188,7 +1205,11 @@ async fn main() -> Result<()> {
         .next()
         .unwrap_or("rclone")
         .to_owned();
+    let broker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let broker_port = broker_listener.local_addr()?.port();
     let state = Arc::new(State {
+        broker_port,
+        broker_grants: Mutex::new(HashMap::new()),
         version,
         setup_gate: Mutex::new(()),
         remotes: Mutex::new(remotes),
@@ -1202,6 +1223,7 @@ async fn main() -> Result<()> {
         tasks: Mutex::new(HashMap::new()),
         desired_mounts: Mutex::new(HashSet::new()),
     });
+    tokio::spawn(native::broker(state.clone(),broker_listener));
     connection
         .object_server()
         .at(PATH, Cloud(state.clone()))
