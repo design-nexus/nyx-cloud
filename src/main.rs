@@ -48,6 +48,31 @@ fn mount_folder(name: &str) -> String {
         folder
     }
 }
+fn native_storage_name(provider: &str, fallback: &str) -> String {
+    match provider {
+        "google" => "Google Drive",
+        "microsoft_personal" => "OneDrive",
+        "nextcloud" => "Nextcloud",
+        _ => fallback,
+    }.to_owned()
+}
+
+#[cfg(test)]
+mod mount_name_tests {
+    #[test]
+    fn native_accounts_use_full_names_directly_under_home() {
+        assert_eq!(super::native_storage_name("google", "user@example.com"), "Google Drive");
+        assert_eq!(super::native_storage_name("microsoft_personal", "user@example.com"), "OneDrive");
+        let mut remotes = vec![
+            super::new_remote("one", "Google Drive", "one", "drive", true),
+            super::new_remote("two", "Google Drive", "two", "drive", true),
+        ];
+        super::assign_mount_path(&mut remotes, "one");
+        super::assign_mount_path(&mut remotes, "two");
+        assert_eq!(remotes[0].mount_path, super::home().join("Google Drive").to_string_lossy());
+        assert_eq!(remotes[1].mount_path, super::home().join("Google Drive (2)").to_string_lossy());
+    }
+}
 // Earlier accounts keep their folder; later duplicates get " (2)", " (3)", ...
 fn assign_mount_path(remotes: &mut [Remote], id: &str) {
     let Some(index) = remotes.iter().position(|r| r.id == id) else {
@@ -529,8 +554,11 @@ impl Cloud {
         if !account.enabled.contains(&nyx_accounts_native::Service::Files){return Err(error("Enable Files in Online Accounts first"));}
         if let Some(existing)=self.0.remotes.lock().await.iter().find(|r|r.account_id.as_deref()==Some(account_id)){return Ok(existing.id.clone());}
         let id=uuid::Uuid::new_v4().to_string();
-        let mut remote=new_remote(&id,account.label(),&format!("nyx_{}",id.replace('-',"")),match account.provider.as_str(){"google"=>"drive","microsoft_personal"=>"onedrive",_=>"webdav"},true);
-        remote.native_account=true;remote.account_id=Some(account.id);self.0.remotes.lock().await.push(remote);self.0.save().await.map_err(|_|error("Could not save native storage account"))?;self.0.notify().await;Ok(id)
+        let name=native_storage_name(&account.provider,account.label());
+        let mut remote=new_remote(&id,&name,&format!("nyx_{}",id.replace('-',"")),match account.provider.as_str(){"google"=>"drive","microsoft_personal"=>"onedrive",_=>"webdav"},true);
+        remote.native_account=true;remote.account_id=Some(account.id);
+        { let mut remotes=self.0.remotes.lock().await; remotes.push(remote); assign_mount_path(&mut remotes,&id); }
+        self.0.save().await.map_err(|_|error("Could not save native storage account"))?;self.0.notify().await;Ok(id)
     }
     async fn list_remotes(&self) -> zbus::fdo::Result<String> {
         let snapshot = self.0.remotes.lock().await.clone();
