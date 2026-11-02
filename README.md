@@ -30,8 +30,12 @@ changing their original configuration. External reauthentication/removal stays
 with the original configuration tool. Managed accounts can be reauthenticated
 in Settings: the new connection is staged and tested before replacing credentials.
 
-Stable mounts are `$XDG_DATA_HOME/nyx/cloud/mounts/<UUID>`. Their stable paths
-work with bookmarks and ordinary desktop apps; runtime socket paths are used
+Each account mounts at `~/<Account Name>` (for example `~/Google Drive`); a
+second account with the same name gets `~/<Account Name> (2)`. The folder is
+created on connect and removed on disconnect if empty, and an existing non-empty
+folder with that name is never mounted over. Renaming an account moves its folder
+at the next connection. These paths work with bookmarks and ordinary desktop
+apps; runtime socket paths are used
 only for IPC. Flatpak apps may need a file portal grant to access mounted files.
 Each account has an isolated `$XDG_CACHE_HOME/nyx/cloud/<UUID>` VFS cache.
 The 2 GiB default is an eviction target, not a hard quota. Open or dirty files

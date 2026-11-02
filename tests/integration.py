@@ -114,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix='nyx-cloud-test-') as d:
         print('PASS: local WebDAV setup, password privacy, network reconnection and expired authentication')
         print('PASS: discovery, adoption, fresh setup, permissions, FUSE read/write/rename/delete, safe unmount, configuration-only removal, staged reauthentication, mount-on-login startup')
     finally:
-        for mount in (base/'data/nyx/cloud/mounts').glob('*'):
+        for mount in (base/'home').iterdir():
             subprocess.run(['fusermount3','-u',str(mount)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         daemon.terminate()
         try: daemon.wait(timeout=15)
