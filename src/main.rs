@@ -1,4 +1,5 @@
 mod native;
+mod secret;
 use anyhow::{Context, Result, bail};
 use nyx_cloud::{BUS, Discovery, NotesPreferences, PATH, Preferences, Remote};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,46 @@ fn config_dir() -> PathBuf {
 }
 fn config() -> PathBuf {
     config_dir().join("rclone.conf")
+}
+
+/// The managed config's password (from the Secret Service), once the daemon has it.
+static CONFIG_PASS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Lets an rclone process open the managed (encrypted) config.
+fn managed_env(cmd: &mut Command) -> &mut Command {
+    if let Some(Some(pass)) = CONFIG_PASS.get() {
+        cmd.env("RCLONE_CONFIG_PASS", pass);
+    }
+    cmd
+}
+
+const ENCRYPTED: &str = "# Encrypted rclone configuration File";
+
+/// Encrypt the managed config (an empty one if there's none yet: rclone keeps a file
+/// encrypted once it is, but writes a new one in plain text).
+async fn encrypt_config(pass: &str) -> Result<()> {
+    let path = config();
+    let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    if text.starts_with(ENCRYPTED) {
+        return Ok(());
+    }
+    if !path.exists() {
+        tokio::fs::write(&path, "").await?;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    let output = Command::new("rclone")
+        .arg("--config")
+        .arg(&path)
+        .args(["--password-command", "printenv NYX_CLOUD_CONFIG_PASS", "config", "encryption", "set"])
+        .env("NYX_CLOUD_CONFIG_PASS", pass)
+        .env("RCLONE_PASSWORD_CHANGE", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("rclone couldn't encrypt its configuration: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 fn legacy_mounts() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("nyx/cloud/mounts")
@@ -209,6 +250,9 @@ impl State {
             external_config().context("rclone configuration unavailable")?
         };
         let mut cmd = Command::new("rclone");
+        if r.managed {
+            managed_env(&mut cmd);
+        }
         cmd.arg("--config")
             .arg(path)
             .stdin(std::process::Stdio::null())
@@ -1258,7 +1302,23 @@ async fn main() -> Result<()> {
     if rc_path.exists() {
         tokio::fs::remove_file(&rc_path).await?;
     }
-    let mut rc_child = Command::new("rclone")
+    // Cloud's own accounts are kept encrypted, with the password in the Secret Service.
+    // Without a keyring the file stays as rclone writes it (passwords obscured, not encrypted).
+    let pass = match secret::config_password().await {
+        Ok(pass) => match encrypt_config(&pass).await {
+            Ok(()) => Some(pass),
+            Err(e) => {
+                eprintln!("nyx-cloudd: {e:#}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("nyx-cloudd: no Secret Service, so the configuration isn't encrypted: {e:#}");
+            None
+        }
+    };
+    let _ = CONFIG_PASS.set(pass);
+    let mut rc_child = managed_env(&mut Command::new("rclone"))
         .args(["rcd", "--rc-addr"])
         .arg(format!("unix://{}", rc_path.display()))
         .args(["--rc-no-auth", "--config"])

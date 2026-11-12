@@ -1275,6 +1275,7 @@ dependencies = [
  "libc",
  "nyx-accounts-service",
  "reqwest",
+ "secret-service",
  "serde",
  "serde_json",
  "tokio",

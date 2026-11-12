@@ -83,9 +83,13 @@ configure request. No general-purpose RC or shell-command proxy is exposed.
 
 ## Security and limitations
 
-rclone obscured passwords are reversible; file permissions are not encryption.
-OAuth tokens remain in rclone's configuration. Other processes running as the same
-user can access the user's files and private RC sockets. RC sockets never bind a
+Cloud's own rclone configuration (`~/.config/nyx/cloud/rclone.conf`) is encrypted with
+rclone's config encryption; the password is in the Secret Service ("Cloud Storage
+configuration"), so the file and backups of it hold no readable passwords or tokens.
+Without a Secret Service the file stays as rclone writes it (passwords obscured, which
+is reversible). Online Accounts' storage is handed to rclone in memory and never
+written. Other processes running as the same user can still ask the Secret Service and
+use the private RC sockets. RC sockets never bind a
 network port; provider OAuth may use rclone's loopback callback server.
 
 This release does not automatically enable encrypted configurations or store a
