@@ -9,3 +9,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
+      - run: cargo test --locked
+      - name: Integration test (local rclone alias, FUSE, a private bus with no keyring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone fuse3 dbus libglib2.0-bin
+          cargo build --locked
+          tests/run-integration.sh

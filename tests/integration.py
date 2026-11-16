@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run with dbus-run-session -- python3 tests/integration.py. No live accounts."""
+"""Run with tests/run-integration.sh (a private bus with no Secret Service). No live accounts."""
 import ast, json, os, pathlib, socket, subprocess, tempfile, time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUS = 'io.github.design_nexus.nyx.Cloud1'
