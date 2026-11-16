@@ -13,7 +13,15 @@ jobs:
       - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libglib2.0-dev rclone fuse3 dbus libglib2.0-bin
+          sudo apt-get install -y pkg-config libglib2.0-dev fuse3 dbus libglib2.0-bin unzip
+      # Ubuntu's rclone is years older than NyxOS's and lacks the rc calls the service uses.
+      - name: rclone 1.75.2
+        run: |
+          curl -fsSLO https://downloads.rclone.org/v1.75.2/rclone-v1.75.2-linux-amd64.zip
+          echo "349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702  rclone-v1.75.2-linux-amd64.zip" | sha256sum -c
+          unzip -q rclone-v1.75.2-linux-amd64.zip
+          sudo install -m755 rclone-v1.75.2-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version | head -1
       - run: cargo build --release --locked
       - run: cargo test --locked
       - name: Integration test (local rclone alias, FUSE, a private bus with no keyring)
