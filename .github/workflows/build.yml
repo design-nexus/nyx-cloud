@@ -8,11 +8,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # glib/gio for the accounts service crate; rclone, FUSE, a session bus and gdbus for
+      # the integration test.
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libglib2.0-dev rclone fuse3 dbus libglib2.0-bin
       - run: cargo build --release --locked
       - run: cargo test --locked
       - name: Integration test (local rclone alias, FUSE, a private bus with no keyring)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rclone fuse3 dbus libglib2.0-bin
           cargo build --locked
           tests/run-integration.sh
