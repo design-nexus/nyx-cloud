@@ -74,6 +74,104 @@ async fn encrypt_config(pass: &str) -> Result<()> {
     }
     Ok(())
 }
+fn is_encrypted() -> bool {
+    std::fs::read_to_string(config()).is_ok_and(|t| t.starts_with(ENCRYPTED))
+}
+
+/// Whether `pass` opens the managed config.
+async fn opens(pass: &str) -> bool {
+    Command::new("rclone")
+        .arg("--config")
+        .arg(config())
+        .args(["--password-command", "printenv NYX_CLOUD_CONFIG_PASS", "--ask-password=false", "listremotes"])
+        .env("NYX_CLOUD_CONFIG_PASS", pass)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Cloud's own accounts are kept encrypted, with the password in the Secret Service.
+/// Without a keyring a plain file stays as rclone writes it (passwords obscured, not
+/// encrypted); an encrypted one waits for the keyring. When the keyring answers but no
+/// longer has the password (a reset, a home folder restored without it), the accounts
+/// can't be opened again: their files are set aside, Cloud starts over, and says so.
+async fn config_password(bus: &zbus::Connection) -> Result<Option<String>> {
+    let mut tries = 0;
+    let stored = loop {
+        match secret::stored_password().await {
+            Ok(stored) => break stored,
+            Err(e) if !is_encrypted() => {
+                eprintln!("nyx-cloudd: no Secret Service, so the configuration isn't encrypted: {e:#}");
+                return Ok(None);
+            }
+            // At sign-in the keyring can come up after Cloud.
+            Err(e) if tries >= 30 => {
+                bail!("Cloud's accounts are encrypted and the keyring can't be reached, so they can't be opened: {e:#}")
+            }
+            Err(_) => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    let pass = match stored {
+        secret::Stored::Password(p) if !is_encrypted() || opens(&p).await => p,
+        _ if is_encrypted() => {
+            let kept = set_aside_unreadable()?;
+            eprintln!("nyx-cloudd: the keyring has no password that opens rclone.conf; set aside as {}", kept.display());
+            tell(
+                bus,
+                "Cloud couldn't open its saved accounts",
+                &format!(
+                    "The keyring no longer has the password that unlocks them, so Cloud started over. Add your storage again in Settings › Online Accounts. The old files are kept in {}.",
+                    kept.display()
+                ),
+            )
+            .await;
+            secret::new_password().await?
+        }
+        _ => secret::new_password().await?,
+    };
+    match encrypt_config(&pass).await {
+        Ok(()) => Ok(Some(pass)),
+        Err(e) => {
+            eprintln!("nyx-cloudd: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// Move the config and the accounts list it belongs to into a dated folder beside them,
+/// and leave an empty config.
+fn set_aside_unreadable() -> Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let kept = config_dir().join(format!("unreadable-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    std::fs::create_dir_all(&kept)?;
+    for name in ["rclone.conf", "accounts.json"] {
+        let from = config_dir().join(name);
+        if from.exists() {
+            std::fs::rename(&from, kept.join(name))?;
+        }
+    }
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(config())?;
+    Ok(kept)
+}
+
+/// A desktop notification from Cloud.
+async fn tell(bus: &zbus::Connection, summary: &str, body: &str) {
+    let hints: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
+    let _ = bus
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &("Cloud Storage", 0u32, "folder-remote-symbolic", summary, body, Vec::<&str>::new(), hints, -1i32),
+        )
+        .await;
+}
+
 fn legacy_mounts() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("nyx/cloud/mounts")
 }
@@ -1302,21 +1400,7 @@ async fn main() -> Result<()> {
     if rc_path.exists() {
         tokio::fs::remove_file(&rc_path).await?;
     }
-    // Cloud's own accounts are kept encrypted, with the password in the Secret Service.
-    // Without a keyring the file stays as rclone writes it (passwords obscured, not encrypted).
-    let pass = match secret::config_password().await {
-        Ok(pass) => match encrypt_config(&pass).await {
-            Ok(()) => Some(pass),
-            Err(e) => {
-                eprintln!("nyx-cloudd: {e:#}");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("nyx-cloudd: no Secret Service, so the configuration isn't encrypted: {e:#}");
-            None
-        }
-    };
+    let pass = config_password(&connection).await?;
     let _ = CONFIG_PASS.set(pass);
     let mut rc_child = managed_env(&mut Command::new("rclone"))
         .args(["rcd", "--rc-addr"])

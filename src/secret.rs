@@ -12,8 +12,16 @@ fn attributes() -> HashMap<&'static str, &'static str> {
     HashMap::from([("application", "nyx-cloud"), ("kind", "rclone-config")])
 }
 
-/// The password, made and saved the first time.
-pub async fn config_password() -> Result<String> {
+/// What the keyring has for the configuration.
+pub enum Stored {
+    Password(String),
+    /// The keyring answered and holds no password for it.
+    Missing,
+}
+
+/// The saved password, or [`Stored::Missing`]. An error means the keyring couldn't be asked
+/// (not running yet, or its unlock was dismissed), which says nothing about the item.
+pub async fn stored_password() -> Result<Stored> {
     let service = SecretService::connect(EncryptionType::Dh).await?;
     let found = service.search_items(attributes()).await?;
     for item in found.unlocked.iter().chain(found.locked.iter()) {
@@ -23,9 +31,18 @@ pub async fn config_password() -> Result<String> {
         let secret = item.get_secret().await?;
         if let Ok(text) = String::from_utf8(secret) {
             if !text.is_empty() {
-                return Ok(text);
+                return Ok(Stored::Password(text));
             }
         }
+    }
+    Ok(Stored::Missing)
+}
+
+/// A new password, saved in place of any old one.
+pub async fn new_password() -> Result<String> {
+    let service = SecretService::connect(EncryptionType::Dh).await?;
+    for item in service.search_items(attributes()).await?.unlocked {
+        let _ = item.delete().await;
     }
     let mut bytes = [0u8; 32];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
