@@ -17,6 +17,8 @@ Files; mount-on-login is opt-in per account.
 
 ## Install
 
+On NyxOS, install Cloud from the Store or with `nyx install nyx-cloud`. On Omarchy:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/design-nexus/nyx-cloud/main/install.sh | bash
 ```
